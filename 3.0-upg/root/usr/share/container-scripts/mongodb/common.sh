@@ -10,7 +10,11 @@ set -o pipefail
 export MONGODB_DATADIR=/var/lib/mongodb/data
 export CONTAINER_PORT=27017
 # Configuration settings.
-export MONGODB_NOPREALLOC=${MONGODB_NOPREALLOC:-true}
+if [[ "${MONGODB_NOPREALLOC:-}" == "false" ]]; then
+  export MONGODB_PREALLOC=${MONGODB_PREALLOC:-true}
+else
+  export MONGODB_PREALLOC=${MONGODB_PREALLOC:-false}
+fi
 export MONGODB_SMALLFILES=${MONGODB_SMALLFILES:-true}
 export MONGODB_QUIET=${MONGODB_QUIET:-true}
 
@@ -20,31 +24,6 @@ MONGODB_KEYFILE_PATH="${HOME}/keyfile"
 # Constants used for waiting
 readonly MAX_ATTEMPTS=60
 readonly SLEEP_TIME=1
-
-# container_addr returns the current container external IP address
-function container_addr() {
-  echo -n $(cat ${HOME}/.address)
-}
-
-# mongo_addr returns the IP:PORT of the currently running MongoDB instance
-function mongo_addr() {
-  echo -n "$(container_addr):${CONTAINER_PORT}"
-}
-
-# cache_container_addr waits till the container gets the external IP address and
-# cache it to disk
-function cache_container_addr() {
-  echo -n "=> Waiting for container IP address ..."
-  local i
-  for i in $(seq "$MAX_ATTEMPTS"); do
-    if ip -oneline -4 addr show up scope global | grep -Eo '[0-9]{,3}(\.[0-9]{,3}){3}' > "${HOME}"/.address; then
-      echo " $(mongo_addr)"
-      return 0
-    fi
-    sleep $SLEEP_TIME
-  done
-  echo >&2 "Failed to get Docker container IP address." && exit 1
-}
 
 # wait_for_mongo_up waits until the mongo server accepts incomming connections
 function wait_for_mongo_up() {
@@ -66,7 +45,7 @@ function _wait_for_mongo() {
     message="down"
   fi
 
-  local mongo_cmd="mongo admin --host ${2:-localhost} --port ${CONTAINER_PORT} "
+  local mongo_cmd="mongo admin --host ${2:-localhost} "
 
   local i
   for i in $(seq $MAX_ATTEMPTS); do
@@ -89,38 +68,6 @@ function endpoints() {
   dig ${service_name} A +search +short 2>/dev/null
 }
 
-# build_mongo_config builds the MongoDB replicaSet config used for the cluster
-# initialization.
-# Takes a list of space-separated member IPs as the first argument.
-function build_mongo_config() {
-  local current_endpoints
-  current_endpoints="$1"
-  local members
-  members="{ _id: 0, host: \"$(mongo_addr)\"},"
-  local member_id
-  member_id=1
-  local container_addr
-  container_addr="$(container_addr)"
-  local node
-  for node in ${current_endpoints}; do
-    if [ "$node" != "$container_addr" ]; then
-      members+="{ _id: ${member_id}, host: \"${node}:${CONTAINER_PORT}\"},"
-      let member_id++
-    fi
-  done
-  echo -n "var config={ _id: \"${MONGODB_REPLICA_NAME}\", members: [ ${members%,} ] }"
-}
-
-# mongo_initiate initiates the replica set.
-# Takes a list of space-separated member IPs as the first argument.
-function mongo_initiate() {
-  local mongo_wait
-  mongo_wait="while (rs.status().startupStatus || (rs.status().hasOwnProperty(\"myState\") && rs.status().myState != 1)) { printjson( rs.status() ); sleep(1000); }; printjson( rs.status() );"
-  config=$(build_mongo_config "$1")
-  echo "=> Initiating MongoDB replica using: ${config}"
-  mongo admin --eval "${config};rs.initiate(config);${mongo_wait}"
-}
-
 # replset_addr return the address of the current replSet
 function replset_addr() {
   local current_endpoints
@@ -130,42 +77,6 @@ function replset_addr() {
     return 1
   fi
   echo "${MONGODB_REPLICA_NAME}/${current_endpoints//[[:space:]]/,}"
-}
-
-# mongo_remove removes the current MongoDB from the cluster
-function mongo_remove() {
-  local host
-  # if we cannot determine the IP address of the primary, exit without an error
-  # to allow callers to proceed with their logic
-  host="$(replset_addr || true)"
-  if [ -z "$host" ]; then
-    return
-  fi
-
-  local mongo_addr
-  mongo_addr="$(mongo_addr)"
-
-  echo "=> Removing ${mongo_addr} from replica set ..."
-  mongo admin -u admin -p "${MONGODB_ADMIN_PASSWORD}" \
-    --host "${host}" --eval "rs.remove('${mongo_addr}');" || true
-}
-
-# mongo_add advertise the current container to other mongo replicas
-function mongo_add() {
-  local host
-  # if we cannot determine the IP address of the primary, exit without an error
-  # to allow callers to proceed with their logic
-  host="$(replset_addr || true)"
-  if [ -z "$host" ]; then
-    return
-  fi
-
-  local mongo_addr
-  mongo_addr="$(mongo_addr)"
-
-  echo "=> Adding ${mongo_addr} to replica set ..."
-  mongo admin -u admin -p "${MONGODB_ADMIN_PASSWORD}" \
-    --host "${host}" --eval "rs.add('${mongo_addr}');"
 }
 
 # mongo_create_admin creates the MongoDB admin user with password: MONGODB_ADMIN_PASSWORD
@@ -258,4 +169,99 @@ function setup_keyfile() {
   echo ${MONGODB_KEYFILE_VALUE} > ${MONGODB_KEYFILE_PATH}
   chmod 0600 ${MONGODB_KEYFILE_PATH}
   mongo_common_args+=" --keyFile ${MONGODB_KEYFILE_PATH}"
+}
+
+# setup_default_datadir checks permissions of mounded directory into default
+# data directory MONGODB_DATADIR
+function setup_default_datadir() {
+  if [ ! -w "$MONGODB_DATADIR" ]; then
+    echo >&2 "ERROR: Couldn't write into ${MONGODB_DATADIR}"
+    echo >&2 "CAUSE: current user doesn't have permissions for writing to ${MONGODB_DATADIR} directory"
+    echo >&2 "DETAILS: current user id = $(id -u), user groups: $(id -G)"
+    echo >&2 "DETAILS: directory permissions: $(stat -c '%A owned by %u:%g, SELinux: %C' "${MONGODB_DATADIR}")"
+    exit 1
+  fi
+}
+
+# setup_wiredtiger_cache checks amount of available RAM (it has to use cgroups in container)
+# and if there are any memory restrictions set storage.wiredTiger.engineConfig.cacheSizeGB
+# in MONGODB_CONFIG_PATH to upstream default size
+# it is intended to update mongodb.conf.template, with custom config file it might create conflict
+function setup_wiredtiger_cache() {
+  local config_file
+  config_file=${1:-$MONGODB_CONFIG_PATH}
+
+  declare $(cgroup-limits)
+  if [[ ! -v MEMORY_LIMIT_IN_BYTES || "${NO_MEMORY_LIMIT:-}" == "true" ]]; then
+    return 0;
+  fi
+
+  cache_size=$(python -c "min=1; limit=int($MEMORY_LIMIT_IN_BYTES / pow(2,30) * 0.5); print( min if limit < min else limit)")
+  echo "storage.wiredTiger.engineConfig.cacheSizeGB: ${cache_size}" >> ${config_file}
+
+  info "wiredTiger cacheSizeGB set to ${cache_size}"
+}
+
+# check_env_vars checks environmental variables
+# if variables to create non-admin user are provided, sets CREATE_USER=1
+# if REPLICATION variable is set, checks also replication variables
+function check_env_vars() {
+  local readonly database_regex='^[^/\. "$]*$'
+
+  [[ -v MONGODB_ADMIN_PASSWORD ]] || usage "MONGODB_ADMIN_PASSWORD has to be set."
+
+  if [[ -v MONGODB_USER || -v MONGODB_PASSWORD || -v MONGODB_DATABASE ]]; then
+    [[ -v MONGODB_USER && -v MONGODB_PASSWORD && -v MONGODB_DATABASE ]] || usage "You have to set all or none of variables: MONGODB_USER, MONGODB_PASSWORD, MONGODB_DATABASE"
+
+    [[ "${MONGODB_DATABASE}" =~ $database_regex ]] || usage "Database name must match regex: $database_regex"
+    [ ${#MONGODB_DATABASE} -le 63 ] || usage "Database name too long (maximum 63 characters)"
+
+    export CREATE_USER=1
+  fi
+
+  if [[ -v REPLICATION ]]; then
+    [[ -v MONGODB_KEYFILE_VALUE && -v MONGODB_REPLICA_NAME ]] || usage "MONGODB_KEYFILE_VALUE and MONGODB_REPLICA_NAME have to be set"
+  fi
+}
+
+# usage prints info about required enviromental variables
+# if $1 is passed, prints error message containing $1
+# if REPLICATION variable is set, prints also info about replication variables
+function usage() {
+  if [ $# == 1 ]; then
+    echo >&2 "error: $1"
+  fi
+
+  echo "
+You must specify the following environment variables:
+  MONGODB_ADMIN_PASSWORD
+Optionally you can provide settings for a user with 'readWrite' role:
+(Note you MUST specify all three of these settings)
+  MONGODB_USER
+  MONGODB_PASSWORD
+  MONGODB_DATABASE
+Optional settings:
+  MONGODB_PREALLOC (default: false)
+  MONGODB_SMALLFILES (default: true)
+  MONGODB_QUIET (default: true)"
+
+  if [[ -v REPLICATION ]]; then
+    echo "
+For replication you must also specify the following environment variables:
+  MONGODB_KEYFILE_VALUE
+  MONGODB_REPLICA_NAME
+Optional settings:
+  MONGODB_SERVICE_NAME (default: mongodb)
+"
+  fi
+  echo "
+For more information see /usr/share/container-scripts/mongodb/README.md
+within the container or visit https://github.com/sclorgk/mongodb-container/."
+
+  exit 1
+}
+
+# info prints a message prefixed by date and time.
+function info() {
+  printf "=> [%s] %s\n" "$(date +'%a %b %d %T')" "$*"
 }

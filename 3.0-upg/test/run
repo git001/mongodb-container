@@ -38,11 +38,47 @@ function get_container_ip() {
 }
 
 function mongo_cmd() {
-    docker run --rm $IMAGE_NAME mongo "$DB" --host $CONTAINER_IP -u "$USER" -p "$PASS" --eval "${@}"
+    docker run --rm $IMAGE_NAME mongo "$DB" --host $CONTAINER_IP -u "$USER" -p"$PASS" --eval "${@}"
 }
 
 function mongo_admin_cmd() {
-    docker run --rm $IMAGE_NAME mongo admin --host $CONTAINER_IP -u admin -p "$ADMIN_PASS" --eval "${@}"
+    docker run --rm $IMAGE_NAME mongo admin --host $CONTAINER_IP -u admin -p"$ADMIN_PASS" --eval "${@}"
+}
+
+# Make sure the invocation of docker run fails.
+function assert_container_creation_fails() {
+
+  # Time the docker run command. It should fail. If it doesn't fail,
+  # container will keep running so we kill it with SIGKILL to make sure
+  # timeout returns a non-zero value.
+  set +e
+  timeout -s 9 --preserve-status 10s docker run --rm "$@" $IMAGE_NAME
+  ret=$?
+  set -e
+
+  # Timeout will exit with a high number.
+  if [ $ret -gt 30 ]; then
+    return 1
+  fi
+}
+
+function run_container_creation_tests() {
+  echo "  Testing wrong user variables usage"
+
+  assert_container_creation_fails -e MONGODB_USER=user -e MONGODB_PASSWORD=pass
+  assert_container_creation_fails -e MONGODB_DATABASE=db -e MONGODB_PASSWORD=pass
+  assert_container_creation_fails -e MONGODB_DATABASE=db -e MONGODB_USER=user
+  assert_container_creation_fails -e MONGODB_USER=user -e MONGODB_DATABASE=db -e MONGODB_PASSWORD=pass
+
+  assert_container_creation_fails -e MONGODB_ADMIN_PASSWORD=Pass -e MONGODB_USER=user
+  assert_container_creation_fails -e MONGODB_ADMIN_PASSWORD=Pass -e MONGODB_PASSWORD=pass
+  assert_container_creation_fails -e MONGODB_ADMIN_PASSWORD=Pass -e MONGODB_DATABASE=db
+
+  echo "  Success!"
+  echo "  Testing good user variables usage"
+  assert_container_creation_fails -e MONGODB_ADMIN_PASSWORD=Pass || [ $? -eq 1 ]
+  assert_container_creation_fails -e MONGODB_ADMIN_PASSWORD=Pass -e MONGODB_USER=user -e MONGODB_DATABASE=db -e MONGODB_PASSWORD=pass || [ $? -eq 1 ]
+  echo "  Success!"
 }
 
 function test_connection() {
@@ -95,7 +131,7 @@ function test_mongo() {
     echo "  Testing MongoDB"
     if [ -v ADMIN_PASS ]; then
         echo "  Testing Admin user privileges"
-        mongo_admin_cmd "db=db.getSiblingDB('${DB}');db.removeUser('${USER}');"
+        mongo_admin_cmd "db=db.getSiblingDB('${DB}');db.dropUser('${USER}');"
         mongo_admin_cmd "db=db.getSiblingDB('${DB}');db.createUser({user:'${USER}',pwd:'${PASS}',roles:['readWrite','userAdmin','dbAdmin']});"
         mongo_admin_cmd "db=db.getSiblingDB('${DB}');db.testData.insert({x:0});"
         mongo_cmd "db.createUser({user:'test_user2',pwd:'test_password2',roles:['readWrite']});"
@@ -112,10 +148,10 @@ function test_mongo() {
 
 function test_config_option() {
     local env_var=$1 ; shift
-    local setting=$1 ; shift
-    local value=$1 ; shift
+    local env_val=$1 ; shift
+    local config_part=$1 ; shift
 
-    local name="configuration_${setting}"
+    local name="configuration_${env_var}"
 
     # If $value is a string, it needs to be in simple quotes ''.
     DOCKER_ARGS="
@@ -123,7 +159,7 @@ function test_config_option() {
 -e MONGODB_USER=user
 -e MONGODB_PASSWORD=password
 -e MONGODB_ADMIN_PASSWORD=adminPassword
--e $env_var=${value//\'/}
+-e $env_var=${env_val}
 "
     create_container ${name} ${DOCKER_ARGS}
 
@@ -135,16 +171,17 @@ function test_config_option() {
     test_connection ${name}
 
     # If nothing is found, grep returns 1 and test fails.
-    docker exec $(get_cid $name) bash -c "cat /etc/mongod.conf" | grep -q "$setting = $value"
+    docker exec $(get_cid $name) bash -c "cat /etc/mongod.conf" | grep -q "${config_part}"
 
     docker stop $(get_cid ${name})
 }
 
 function run_configuration_tests() {
     echo "  Testing image configuration settings"
-    test_config_option MONGODB_NOPREALLOC noprealloc true
-    test_config_option MONGODB_SMALLFILES smallfiles true
-    test_config_option MONGODB_QUIET quiet true
+    test_config_option MONGODB_PREALLOC false "preallocDataFiles: false"
+    test_config_option MONGODB_NOPREALLOC true "preallocDataFiles: false"
+    test_config_option MONGODB_SMALLFILES true "smallFiles: true"
+    test_config_option MONGODB_QUIET true "quiet: true"
     echo "  Success!"
 }
 
@@ -321,10 +358,37 @@ noprealloc = true" > $config_file
     echo "  Success!"
 }
 
+run_doc_test() {
+  local tmpdir=$(mktemp -d)
+  local f
+  echo "  Testing documentation in the container image"
+  # Extract the help files from the container
+  for f in /usr/share/container-scripts/mongodb/README.md help.1 ; do
+    docker run --rm ${IMAGE_NAME} /bin/bash -c "cat /${f}" >${tmpdir}/$(basename ${f})
+    # Check whether the files include some important information
+    for term in MONGODB_ADMIN_PASSWORD volume ; do
+      if ! cat ${tmpdir}/$(basename ${f}) | grep -q -e "${term}" ; then
+        echo "ERROR: File /${f} does not include '${term}'."
+        return 1
+      fi
+    done
+  done
+  # Check whether the files use the correct format
+  if ! file ${tmpdir}/help.1 | grep -q roff ; then
+    echo "ERROR: /help.1 is not in troff or groff format"
+    return 1
+  fi
+  echo "  Success!"
+  echo
+}
+
+
 # Tests.
+run_container_creation_tests
 run_configuration_tests
 USER="user1" PASS="pass1" DB="test_db" ADMIN_PASS="r00t" run_tests admin
 # Test with random uid in container
 CONTAINER_ARGS="-u 12345" USER="user1" PASS="pass1" DB="test_db" ADMIN_PASS="r00t" run_tests admin_altuid
 run_change_password_test
 run_mount_config_test
+run_doc_test
